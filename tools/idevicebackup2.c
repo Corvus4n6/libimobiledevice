@@ -347,11 +347,14 @@ static char* get_uuid()
  * ProductType "iPhone14,4") but this tool has never populated (see the
  * removed "FIXME Product Name" below). Apple does not expose this mapping
  * anywhere queryable from the device itself, so it has to be a maintained
- * table -- this covers iPhone1,1 through the iPhone 16 / iPhone SE (3rd
- * generation) lineup. Entries for models released after this table was
- * last updated will simply fall through to no "Product Name" being set
- * (the same behavior as before this patch), not an incorrect one -- see
- * product_type_to_name()'s doc comment for how to extend it.
+ * table -- this covers every iPhone (iPhone1,1 through the iPhone 17 /
+ * iPhone Air / iPhone 17e lineup) and every iPad (original iPad through
+ * iPad Pro M4, including iPad mini and iPad Air). idevicebackup2 backs up
+ * iPads through the same code path, so both device families' backups
+ * benefit from this field. Entries for models released after this table
+ * was last updated will simply fall through to no "Product Name" being
+ * set (the same behavior as before this patch), not an incorrect one --
+ * see product_type_to_name()'s doc comment for how to extend it.
  */
 struct product_type_name_entry {
 	const char *product_type;
@@ -418,20 +421,139 @@ static const struct product_type_name_entry product_type_names[] = {
 	{ "iPhone17,3", "iPhone 16" },
 	{ "iPhone17,4", "iPhone 16 Plus" },
 	{ "iPhone17,5", "iPhone 16e" },
+	{ "iPhone18,1", "iPhone 17 Pro" },
+	{ "iPhone18,2", "iPhone 17 Pro Max" },
+	{ "iPhone18,3", "iPhone 17" },
+	{ "iPhone18,4", "iPhone Air" },
+	{ "iPhone18,5", "iPhone 17e" },
+
+	/* iPad */
+	{ "iPad1,1", "iPad" },
+	{ "iPad1,2", "iPad" },
+	{ "iPad2,1", "iPad 2" },
+	{ "iPad2,2", "iPad 2" },
+	{ "iPad2,3", "iPad 2" },
+	{ "iPad2,4", "iPad 2" },
+	{ "iPad3,1", "iPad (3rd generation)" },
+	{ "iPad3,2", "iPad (3rd generation)" },
+	{ "iPad3,3", "iPad (3rd generation)" },
+	{ "iPad3,4", "iPad (4th generation)" },
+	{ "iPad3,5", "iPad (4th generation)" },
+	{ "iPad3,6", "iPad (4th generation)" },
+	{ "iPad6,11", "iPad (5th generation)" },
+	{ "iPad6,12", "iPad (5th generation)" },
+	{ "iPad7,5", "iPad (6th generation)" },
+	{ "iPad7,6", "iPad (6th generation)" },
+	{ "iPad7,11", "iPad (7th generation)" },
+	{ "iPad7,12", "iPad (7th generation)" },
+	{ "iPad11,6", "iPad (8th generation)" },
+	{ "iPad11,7", "iPad (8th generation)" },
+	{ "iPad12,1", "iPad (9th generation)" },
+	{ "iPad12,2", "iPad (9th generation)" },
+	{ "iPad13,18", "iPad (10th generation)" },
+	{ "iPad13,19", "iPad (10th generation)" },
+	{ "iPad15,7", "iPad (11th generation)" },
+	{ "iPad15,8", "iPad (11th generation)" },
+
+	/* iPad mini */
+	{ "iPad2,5", "iPad mini" },
+	{ "iPad2,6", "iPad mini" },
+	{ "iPad2,7", "iPad mini" },
+	{ "iPad4,4", "iPad mini 2" },
+	{ "iPad4,5", "iPad mini 2" },
+	{ "iPad4,6", "iPad mini 2" },
+	{ "iPad4,7", "iPad mini 3" },
+	{ "iPad4,8", "iPad mini 3" },
+	{ "iPad4,9", "iPad mini 3" },
+	{ "iPad5,1", "iPad mini 4" },
+	{ "iPad5,2", "iPad mini 4" },
+	{ "iPad11,1", "iPad mini (5th generation)" },
+	{ "iPad11,2", "iPad mini (5th generation)" },
+	{ "iPad14,1", "iPad mini (6th generation)" },
+	{ "iPad14,2", "iPad mini (6th generation)" },
+	{ "iPad16,1", "iPad mini (7th generation)" },
+	{ "iPad16,2", "iPad mini (7th generation)" },
+
+	/* iPad Air */
+	{ "iPad4,1", "iPad Air" },
+	{ "iPad4,2", "iPad Air" },
+	{ "iPad4,3", "iPad Air" },
+	{ "iPad5,3", "iPad Air 2" },
+	{ "iPad5,4", "iPad Air 2" },
+	{ "iPad11,3", "iPad Air (3rd generation)" },
+	{ "iPad11,4", "iPad Air (3rd generation)" },
+	{ "iPad13,1", "iPad Air (4th generation)" },
+	{ "iPad13,2", "iPad Air (4th generation)" },
+	{ "iPad13,16", "iPad Air (5th generation)" },
+	{ "iPad13,17", "iPad Air (5th generation)" },
+	{ "iPad14,8", "iPad Air 11-inch (6th generation)" },
+	{ "iPad14,9", "iPad Air 11-inch (6th generation)" },
+	{ "iPad14,10", "iPad Air 13-inch (6th generation)" },
+	{ "iPad14,11", "iPad Air 13-inch (6th generation)" },
+	{ "iPad15,3", "iPad Air 11-inch (7th generation)" },
+	{ "iPad15,4", "iPad Air 11-inch (7th generation)" },
+	{ "iPad15,5", "iPad Air 13-inch (7th generation)" },
+	{ "iPad15,6", "iPad Air 13-inch (7th generation)" },
+	{ "iPad16,8", "iPad Air 11-inch (8th generation)" },
+	{ "iPad16,9", "iPad Air 11-inch (8th generation)" },
+	{ "iPad16,10", "iPad Air 13-inch (8th generation)" },
+	{ "iPad16,11", "iPad Air 13-inch (8th generation)" },
+
+	/* iPad Pro */
+	{ "iPad6,3", "iPad Pro (9.7-inch)" },
+	{ "iPad6,4", "iPad Pro (9.7-inch)" },
+	{ "iPad6,7", "iPad Pro (12.9-inch)" },
+	{ "iPad6,8", "iPad Pro (12.9-inch)" },
+	{ "iPad7,1", "iPad Pro 12.9-inch (2nd generation)" },
+	{ "iPad7,2", "iPad Pro 12.9-inch (2nd generation)" },
+	{ "iPad7,3", "iPad Pro 10.5-inch" },
+	{ "iPad7,4", "iPad Pro 10.5-inch" },
+	{ "iPad8,1", "iPad Pro 11-inch (1st generation)" },
+	{ "iPad8,2", "iPad Pro 11-inch (1st generation)" },
+	{ "iPad8,3", "iPad Pro 11-inch (1st generation)" },
+	{ "iPad8,4", "iPad Pro 11-inch (1st generation)" },
+	{ "iPad8,5", "iPad Pro 12.9-inch (3rd generation)" },
+	{ "iPad8,6", "iPad Pro 12.9-inch (3rd generation)" },
+	{ "iPad8,7", "iPad Pro 12.9-inch (3rd generation)" },
+	{ "iPad8,8", "iPad Pro 12.9-inch (3rd generation)" },
+	{ "iPad8,9", "iPad Pro 11-inch (2nd generation)" },
+	{ "iPad8,10", "iPad Pro 11-inch (2nd generation)" },
+	{ "iPad8,11", "iPad Pro 12.9-inch (4th generation)" },
+	{ "iPad8,12", "iPad Pro 12.9-inch (4th generation)" },
+	{ "iPad13,4", "iPad Pro 11-inch (3rd generation)" },
+	{ "iPad13,5", "iPad Pro 11-inch (3rd generation)" },
+	{ "iPad13,6", "iPad Pro 11-inch (3rd generation)" },
+	{ "iPad13,7", "iPad Pro 11-inch (3rd generation)" },
+	{ "iPad13,8", "iPad Pro 12.9-inch (5th generation)" },
+	{ "iPad13,9", "iPad Pro 12.9-inch (5th generation)" },
+	{ "iPad13,10", "iPad Pro 12.9-inch (5th generation)" },
+	{ "iPad13,11", "iPad Pro 12.9-inch (5th generation)" },
+	{ "iPad14,3", "iPad Pro 11-inch (4th generation)" },
+	{ "iPad14,4", "iPad Pro 11-inch (4th generation)" },
+	{ "iPad14,5", "iPad Pro 12.9-inch (6th generation)" },
+	{ "iPad14,6", "iPad Pro 12.9-inch (6th generation)" },
+	{ "iPad16,3", "iPad Pro 11-inch (M4)" },
+	{ "iPad16,4", "iPad Pro 11-inch (M4)" },
+	{ "iPad16,5", "iPad Pro 13-inch (M4)" },
+	{ "iPad16,6", "iPad Pro 13-inch (M4)" },
 };
 
 /* Looks up product_type (e.g. "iPhone14,4", the raw ProductType lockdown
  * value) in product_type_names and returns its marketing name (e.g.
  * "iPhone 13 mini"), or NULL if not found -- either because product_type
- * is a device family this table doesn't cover yet (iPad, iPod touch,
- * Apple Watch, Apple TV), or because it's a model released after this
- * table was last updated. In either case the caller must treat NULL as
+ * is a device family this table doesn't cover yet (iPod touch, Apple Watch,
+ * Apple TV -- iPhone and iPad are both covered), or because it's a model
+ * released after this table was last updated. In either case the caller must treat NULL as
  * "leave Product Name unset", not as an error: a missing marketing name is
  * exactly the same, unavoidable gap this function replaces (an
  * unimplemented "FIXME"), just narrowed to fewer product types over time
  * as the table is extended -- new entries should keep the same
  * ProductType-as-reported-by-lockdown format, sourced from a real device
- * or a reliable public reference (e.g. https://www.theiphonewiki.com/wiki/Models).
+ * or a reliable public reference (e.g.
+ * https://gist.github.com/adamawolf/3048717, a widely-cited, actively
+ * maintained community list of Apple device identifiers -- the iPhone Wiki,
+ * an older commonly-cited source for this, is no longer reliably reachable
+ * and is no longer actively maintained).
  */
 static const char *product_type_to_name(const char *product_type)
 {
