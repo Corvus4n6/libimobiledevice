@@ -342,6 +342,111 @@ static char* get_uuid()
 	return uuid;
 }
 
+/* ProductType -> marketing name, for the "Product Name" field a real
+ * iTunes/Finder backup's Info.plist includes (e.g. "iPhone 13 mini" for
+ * ProductType "iPhone14,4") but this tool has never populated (see the
+ * removed "FIXME Product Name" below). Apple does not expose this mapping
+ * anywhere queryable from the device itself, so it has to be a maintained
+ * table -- this covers iPhone1,1 through the iPhone 16 / iPhone SE (3rd
+ * generation) lineup. Entries for models released after this table was
+ * last updated will simply fall through to no "Product Name" being set
+ * (the same behavior as before this patch), not an incorrect one -- see
+ * product_type_to_name()'s doc comment for how to extend it.
+ */
+struct product_type_name_entry {
+	const char *product_type;
+	const char *marketing_name;
+};
+
+static const struct product_type_name_entry product_type_names[] = {
+	/* iPhone */
+	{ "iPhone1,1", "iPhone" },
+	{ "iPhone1,2", "iPhone 3G" },
+	{ "iPhone2,1", "iPhone 3GS" },
+	{ "iPhone3,1", "iPhone 4" },
+	{ "iPhone3,2", "iPhone 4" },
+	{ "iPhone3,3", "iPhone 4" },
+	{ "iPhone4,1", "iPhone 4S" },
+	{ "iPhone5,1", "iPhone 5" },
+	{ "iPhone5,2", "iPhone 5" },
+	{ "iPhone5,3", "iPhone 5c" },
+	{ "iPhone5,4", "iPhone 5c" },
+	{ "iPhone6,1", "iPhone 5s" },
+	{ "iPhone6,2", "iPhone 5s" },
+	{ "iPhone7,1", "iPhone 6 Plus" },
+	{ "iPhone7,2", "iPhone 6" },
+	{ "iPhone8,1", "iPhone 6s" },
+	{ "iPhone8,2", "iPhone 6s Plus" },
+	{ "iPhone8,4", "iPhone SE" },
+	{ "iPhone9,1", "iPhone 7" },
+	{ "iPhone9,2", "iPhone 7 Plus" },
+	{ "iPhone9,3", "iPhone 7" },
+	{ "iPhone9,4", "iPhone 7 Plus" },
+	{ "iPhone10,1", "iPhone 8" },
+	{ "iPhone10,2", "iPhone 8 Plus" },
+	{ "iPhone10,3", "iPhone X" },
+	{ "iPhone10,4", "iPhone 8" },
+	{ "iPhone10,5", "iPhone 8 Plus" },
+	{ "iPhone10,6", "iPhone X" },
+	{ "iPhone11,2", "iPhone XS" },
+	{ "iPhone11,4", "iPhone XS Max" },
+	{ "iPhone11,6", "iPhone XS Max" },
+	{ "iPhone11,8", "iPhone XR" },
+	{ "iPhone12,1", "iPhone 11" },
+	{ "iPhone12,3", "iPhone 11 Pro" },
+	{ "iPhone12,5", "iPhone 11 Pro Max" },
+	{ "iPhone12,8", "iPhone SE (2nd generation)" },
+	{ "iPhone13,1", "iPhone 12 mini" },
+	{ "iPhone13,2", "iPhone 12" },
+	{ "iPhone13,3", "iPhone 12 Pro" },
+	{ "iPhone13,4", "iPhone 12 Pro Max" },
+	{ "iPhone14,2", "iPhone 13 Pro" },
+	{ "iPhone14,3", "iPhone 13 Pro Max" },
+	{ "iPhone14,4", "iPhone 13 mini" },
+	{ "iPhone14,5", "iPhone 13" },
+	{ "iPhone14,6", "iPhone SE (3rd generation)" },
+	{ "iPhone14,7", "iPhone 14" },
+	{ "iPhone14,8", "iPhone 14 Plus" },
+	{ "iPhone15,2", "iPhone 14 Pro" },
+	{ "iPhone15,3", "iPhone 14 Pro Max" },
+	{ "iPhone15,4", "iPhone 15" },
+	{ "iPhone15,5", "iPhone 15 Plus" },
+	{ "iPhone16,1", "iPhone 15 Pro" },
+	{ "iPhone16,2", "iPhone 15 Pro Max" },
+	{ "iPhone17,1", "iPhone 16 Pro" },
+	{ "iPhone17,2", "iPhone 16 Pro Max" },
+	{ "iPhone17,3", "iPhone 16" },
+	{ "iPhone17,4", "iPhone 16 Plus" },
+	{ "iPhone17,5", "iPhone 16e" },
+};
+
+/* Looks up product_type (e.g. "iPhone14,4", the raw ProductType lockdown
+ * value) in product_type_names and returns its marketing name (e.g.
+ * "iPhone 13 mini"), or NULL if not found -- either because product_type
+ * is a device family this table doesn't cover yet (iPad, iPod touch,
+ * Apple Watch, Apple TV), or because it's a model released after this
+ * table was last updated. In either case the caller must treat NULL as
+ * "leave Product Name unset", not as an error: a missing marketing name is
+ * exactly the same, unavoidable gap this function replaces (an
+ * unimplemented "FIXME"), just narrowed to fewer product types over time
+ * as the table is extended -- new entries should keep the same
+ * ProductType-as-reported-by-lockdown format, sourced from a real device
+ * or a reliable public reference (e.g. https://www.theiphonewiki.com/wiki/Models).
+ */
+static const char *product_type_to_name(const char *product_type)
+{
+	if (!product_type) {
+		return NULL;
+	}
+	size_t i;
+	for (i = 0; i < sizeof(product_type_names) / sizeof(product_type_names[0]); i++) {
+		if (strcmp(product_type_names[i].product_type, product_type) == 0) {
+			return product_type_names[i].marketing_name;
+		}
+	}
+	return NULL;
+}
+
 static plist_t mobilebackup_factory_info_plist_new(const char* udid, idevice_t device, afc_client_t afc)
 {
 	/* gather data from lockdown */
@@ -452,6 +557,10 @@ static plist_t mobilebackup_factory_info_plist_new(const char* udid, idevice_t d
 	if (value_node)
 		plist_dict_set_item(ret, "IMEI", plist_copy(value_node));
 
+	value_node = plist_dict_get_item(root_node, "InternationalMobileEquipmentIdentity2");
+	if (value_node)
+		plist_dict_set_item(ret, "IMEI 2", plist_copy(value_node));
+
 	/* Installed Applications */
 	plist_dict_set_item(ret, "Installed Applications", installed_apps);
 
@@ -472,7 +581,16 @@ static plist_t mobilebackup_factory_info_plist_new(const char* udid, idevice_t d
 		plist_dict_set_item(ret, "Phone Number", plist_copy(value_node));
 	}
 
-	/* FIXME Product Name */
+	value_node = plist_dict_get_item(root_node, "ProductType");
+	if (value_node && (plist_get_node_type(value_node) == PLIST_STRING)) {
+		char *product_type_str = NULL;
+		plist_get_string_val(value_node, &product_type_str);
+		const char *product_name = product_type_to_name(product_type_str);
+		if (product_name) {
+			plist_dict_set_item(ret, "Product Name", plist_new_string(product_name));
+		}
+		free(product_type_str);
+	}
 
 	value_node = plist_dict_get_item(root_node, "ProductType");
 	plist_dict_set_item(ret, "Product Type", plist_copy(value_node));
