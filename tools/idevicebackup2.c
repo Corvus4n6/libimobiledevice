@@ -348,13 +348,14 @@ static char* get_uuid()
  * removed "FIXME Product Name" below). Apple does not expose this mapping
  * anywhere queryable from the device itself, so it has to be a maintained
  * table -- this covers every iPhone (iPhone1,1 through the iPhone 17 /
- * iPhone Air / iPhone 17e lineup) and every iPad (original iPad through
- * iPad Pro M4, including iPad mini and iPad Air). idevicebackup2 backs up
- * iPads through the same code path, so both device families' backups
- * benefit from this field. Entries for models released after this table
- * was last updated will simply fall through to no "Product Name" being
- * set (the same behavior as before this patch), not an incorrect one --
- * see product_type_to_name()'s doc comment for how to extend it.
+ * iPhone Air / iPhone 17e lineup), every iPad (original iPad through iPad
+ * Pro M4, including iPad mini and iPad Air), and every iPod touch. Apple
+ * Watch is intentionally NOT covered: its data is backed up as part of its
+ * paired iPhone's own backup, not as a standalone device this function
+ * ever sees a ProductType for. Entries for models released after this
+ * table was last updated will simply fall through to no "Product Name"
+ * being set (the same behavior as before this patch), not an incorrect
+ * one -- see product_type_to_name()'s doc comment for how to extend it.
  */
 struct product_type_name_entry {
 	const char *product_type;
@@ -536,16 +537,29 @@ static const struct product_type_name_entry product_type_names[] = {
 	{ "iPad16,4", "iPad Pro 11-inch (M4)" },
 	{ "iPad16,5", "iPad Pro 13-inch (M4)" },
 	{ "iPad16,6", "iPad Pro 13-inch (M4)" },
+
+	/* iPod touch -- backed up through the same mobilebackup2 service as
+	 * iPhone/iPad (unlike Apple Watch, whose data instead rides along
+	 * inside its paired iPhone's own backup rather than being backed up
+	 * as a standalone device, so it needs no entries of its own here). */
+	{ "iPod1,1", "iPod touch (1st generation)" },
+	{ "iPod2,1", "iPod touch (2nd generation)" },
+	{ "iPod3,1", "iPod touch (3rd generation)" },
+	{ "iPod4,1", "iPod touch (4th generation)" },
+	{ "iPod5,1", "iPod touch (5th generation)" },
+	{ "iPod7,1", "iPod touch (6th generation)" },
+	{ "iPod9,1", "iPod touch (7th generation)" },
 };
 
 /* Looks up product_type (e.g. "iPhone14,4", the raw ProductType lockdown
  * value) in product_type_names and returns its marketing name (e.g.
  * "iPhone 13 mini"), or NULL if not found -- either because product_type
- * is a device family this table doesn't cover yet (iPod touch, Apple Watch,
- * Apple TV -- iPhone and iPad are both covered), or because it's a model
- * released after this table was last updated. In either case the caller must treat NULL as
- * "leave Product Name unset", not as an error: a missing marketing name is
- * exactly the same, unavoidable gap this function replaces (an
+ * is a device family this table doesn't cover (Apple Watch, Apple TV --
+ * iPhone, iPad, and iPod touch are all covered), or because it's a model
+ * released after this table was last updated. In either case the caller
+ * must treat NULL as "leave Product Name unset", not as an error: a
+ * missing marketing name is exactly the same, unavoidable gap this
+ * function replaces (an
  * unimplemented "FIXME"), just narrowed to fewer product types over time
  * as the table is extended -- new entries should keep the same
  * ProductType-as-reported-by-lockdown format, sourced from a real device
