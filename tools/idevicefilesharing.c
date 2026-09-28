@@ -1,0 +1,383 @@
+/*
+ * idevicefilesharing.c
+ * Copy an app's iTunes File Sharing "Documents" folder off a device.
+ *
+ * Copyright (c) 2026 Lexeprint Inc. All Rights Reserved.
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+/*
+ * Unlike ifuse, this needs no FUSE (so no macFUSE on a Mac, and it works
+ * on Windows): it reads the app's Documents folder through house_arrest +
+ * AFC and writes a copy to a local folder. It is read-only toward the
+ * device by construction — it only ever opens device files for reading.
+ *
+ * Unlike afcclient's "get -r", it is built for unattended collection:
+ *   - anything that isn't a regular file or folder (named pipes, sockets,
+ *     symlinks, devices) is skipped WITHOUT being opened — a Realm
+ *     database's named pipes made a plain recursive copy fail;
+ *   - a file that can't be copied is reported and the copy carries on;
+ *   - file modification times are kept;
+ *   - every item is reported on stdout as one tab-separated line, and the
+ *     exit status says how it went.
+ *
+ * Output (stdout, one line per item; <path> is relative to Documents,
+ * with '%', tab, CR and LF percent-escaped):
+ *   FILE  <path>  <bytes>
+ *   SKIP  <path>  <reason>
+ *   ERROR <path>  <message>
+ *   DONE  <files> <bytes> <skipped> <errors>
+ * Exit status: 0 copied (items may have been skipped), 2 copied with
+ * errors, 3 the app has no File Sharing folder (InstallationLookupFailed),
+ * 1 anything else (usage, device, service).
+ */
+
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
+
+#define TOOL_NAME "idevicefilesharing"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <errno.h>
+#include <getopt.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <utime.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <direct.h>
+#define local_mkdir(p) _mkdir(p)
+#else
+#define local_mkdir(p) mkdir(p, 0700)
+#endif
+
+#include <libimobiledevice/libimobiledevice.h>
+#include <libimobiledevice/lockdown.h>
+#include <libimobiledevice/house_arrest.h>
+#include <libimobiledevice/afc.h>
+#include <plist/plist.h>
+
+static uint64_t n_files = 0, n_bytes = 0, n_skipped = 0, n_errors = 0;
+
+/* print_escaped writes s with '%', tab, CR and LF percent-escaped, so a
+ * device-supplied file name can't break the line format. */
+static void print_escaped(const char *s)
+{
+	for (; *s; s++) {
+		switch (*s) {
+		case '%':  fputs("%25", stdout); break;
+		case '\t': fputs("%09", stdout); break;
+		case '\n': fputs("%0A", stdout); break;
+		case '\r': fputs("%0D", stdout); break;
+		default:   fputc(*s, stdout);
+		}
+	}
+}
+
+static void report(const char *kind, const char *rel, const char *detail)
+{
+	fputs(kind, stdout);
+	fputc('\t', stdout);
+	print_escaped(rel);
+	fputc('\t', stdout);
+	fputs(detail, stdout);
+	fputc('\n', stdout);
+	fflush(stdout);
+}
+
+static void report_error(const char *rel, const char *fmt_detail, const char *arg, int code)
+{
+	char msg[512];
+	snprintf(msg, sizeof(msg), fmt_detail, arg, code);
+	report("ERROR", rel, msg);
+	n_errors++;
+}
+
+/* safe_name refuses a device-supplied entry name that could escape the
+ * destination folder or can't be a single local path component. */
+static int safe_name(const char *name)
+{
+	if (!*name || !strcmp(name, ".") || !strcmp(name, "..")) {
+		return 0;
+	}
+	if (strchr(name, '/')) {
+		return 0;
+	}
+#ifdef _WIN32
+	if (strpbrk(name, "\\:*?\"<>|")) {
+		return 0;
+	}
+#endif
+	return 1;
+}
+
+static char *join(const char *a, const char *b)
+{
+	size_t la = strlen(a), lb = strlen(b);
+	char *out = malloc(la + 1 + lb + 1);
+	memcpy(out, a, la);
+	out[la] = '/';
+	memcpy(out + la + 1, b, lb + 1);
+	return out;
+}
+
+/* copy_file copies one regular device file to local; returns bytes copied
+ * or -1 after reporting an error. The device file is only ever opened
+ * read-only. */
+static int64_t copy_file(afc_client_t afc, const char *dev, const char *local, const char *rel)
+{
+	uint64_t fh = 0;
+	afc_error_t err = afc_file_open(afc, dev, AFC_FOPEN_RDONLY, &fh);
+	if (err != AFC_E_SUCCESS) {
+		report_error(rel, "opening on the device failed: %s (%d)", afc_strerror(err), err);
+		return -1;
+	}
+	FILE *f = fopen(local, "wb");
+	if (!f) {
+		afc_file_close(afc, fh);
+		report_error(rel, "creating the local copy failed: %s (%d)", strerror(errno), errno);
+		return -1;
+	}
+	size_t bufsize = 0x100000;
+	char *buf = malloc(bufsize);
+	int64_t total = 0;
+	int ok = 1;
+	while (1) {
+		uint32_t got = 0;
+		err = afc_file_read(afc, fh, buf, bufsize, &got);
+		if (err != AFC_E_SUCCESS) {
+			report_error(rel, "reading from the device failed: %s (%d)", afc_strerror(err), err);
+			ok = 0;
+			break;
+		}
+		if (got == 0) {
+			break;
+		}
+		if (fwrite(buf, 1, got, f) != got) {
+			report_error(rel, "writing the local copy failed: %s (%d)", strerror(errno), errno);
+			ok = 0;
+			break;
+		}
+		total += got;
+	}
+	free(buf);
+	afc_file_close(afc, fh);
+	if (fclose(f) != 0 && ok) {
+		report_error(rel, "writing the local copy failed: %s (%d)", strerror(errno), errno);
+		ok = 0;
+	}
+	return ok ? total : -1;
+}
+
+/* set_mtime gives the local copy the device file's modification time
+ * (st_mtime is nanoseconds since the epoch, as a string). Best-effort. */
+static void set_mtime(const char *local, const char *mtime_ns)
+{
+	if (!mtime_ns) {
+		return;
+	}
+	unsigned long long ns = strtoull(mtime_ns, NULL, 10);
+	if (ns == 0) {
+		return;
+	}
+	struct utimbuf t;
+	t.actime = t.modtime = (time_t)(ns / 1000000000ULL);
+	utime(local, &t);
+}
+
+static void copy_tree(afc_client_t afc, const char *dev, const char *local, const char *rel)
+{
+	char **entries = NULL;
+	afc_error_t err = afc_read_directory(afc, dev, &entries);
+	if (err != AFC_E_SUCCESS) {
+		report_error(*rel ? rel : ".", "listing the folder failed: %s (%d)", afc_strerror(err), err);
+		return;
+	}
+	for (char **p = entries; p && *p; p++) {
+		if (!strcmp(*p, ".") || !strcmp(*p, "..")) {
+			continue;
+		}
+		char *child_rel = *rel ? join(rel, *p) : strdup(*p);
+		if (!safe_name(*p)) {
+			report("SKIP", child_rel, "name not usable as a local file name");
+			n_skipped++;
+			free(child_rel);
+			continue;
+		}
+		char *child_dev = join(dev, *p);
+		char *child_local = join(local, *p);
+
+		char **info = NULL;
+		const char *ifmt = NULL, *size = NULL, *mtime = NULL;
+		err = afc_get_file_info(afc, child_dev, &info);
+		if (err != AFC_E_SUCCESS || !info) {
+			if (err == AFC_E_OBJECT_NOT_FOUND) {
+				report("SKIP", child_rel, "gone when read");
+				n_skipped++;
+			} else {
+				report_error(child_rel, "reading file information failed: %s (%d)", afc_strerror(err), err);
+			}
+		} else {
+			for (char **kv = info; kv[0] && kv[1]; kv += 2) {
+				if (!strcmp(kv[0], "st_ifmt")) ifmt = kv[1];
+				else if (!strcmp(kv[0], "st_size")) size = kv[1];
+				else if (!strcmp(kv[0], "st_mtime")) mtime = kv[1];
+			}
+			(void)size;
+			if (ifmt && !strcmp(ifmt, "S_IFDIR")) {
+				if (local_mkdir(child_local) != 0 && errno != EEXIST) {
+					report_error(child_rel, "creating the local folder failed: %s (%d)", strerror(errno), errno);
+				} else {
+					copy_tree(afc, child_dev, child_local, child_rel);
+					set_mtime(child_local, mtime);
+				}
+			} else if (ifmt && !strcmp(ifmt, "S_IFREG")) {
+				int64_t n = copy_file(afc, child_dev, child_local, child_rel);
+				if (n >= 0) {
+					char num[32];
+					snprintf(num, sizeof(num), "%lld", (long long)n);
+					report("FILE", child_rel, num);
+					n_files++;
+					n_bytes += (uint64_t)n;
+					set_mtime(child_local, mtime);
+				}
+			} else {
+				char why[64];
+				snprintf(why, sizeof(why), "not a regular file (%s)", ifmt ? ifmt : "unknown type");
+				report("SKIP", child_rel, why);
+				n_skipped++;
+			}
+		}
+		if (info) {
+			afc_dictionary_free(info);
+		}
+		free(child_dev);
+		free(child_local);
+		free(child_rel);
+	}
+	afc_dictionary_free(entries);
+}
+
+static void print_usage(const char *name)
+{
+	fprintf(stderr, "Usage: %s [-u UDID] BUNDLE_ID DEST_DIR\n\n", name);
+	fprintf(stderr, "Copy an app's File Sharing Documents folder to DEST_DIR (created if needed).\n");
+}
+
+int main(int argc, char *argv[])
+{
+	const char *udid = NULL;
+	int c;
+	static struct option longopts[] = {
+		{ "udid", required_argument, NULL, 'u' },
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 }
+	};
+	while ((c = getopt_long(argc, argv, "u:h", longopts, NULL)) != -1) {
+		switch (c) {
+		case 'u':
+			udid = optarg;
+			break;
+		case 'h':
+			print_usage(argv[0]);
+			return 0;
+		default:
+			print_usage(argv[0]);
+			return 1;
+		}
+	}
+	if (argc - optind != 2) {
+		print_usage(argv[0]);
+		return 1;
+	}
+	const char *appid = argv[optind];
+	const char *dest = argv[optind + 1];
+
+	idevice_t device = NULL;
+	lockdownd_client_t lockdown = NULL;
+	lockdownd_service_descriptor_t service = NULL;
+	house_arrest_client_t ha = NULL;
+	afc_client_t afc = NULL;
+	int ret = 1;
+
+	if (idevice_new_with_options(&device, udid, IDEVICE_LOOKUP_USBMUX) != IDEVICE_E_SUCCESS) {
+		fprintf(stderr, "ERROR: No device found%s%s\n", udid ? ": " : "", udid ? udid : "");
+		return 1;
+	}
+	do {
+		lockdownd_error_t lerr = lockdownd_client_new_with_handshake(device, &lockdown, TOOL_NAME);
+		if (lerr != LOCKDOWN_E_SUCCESS) {
+			fprintf(stderr, "ERROR: Could not connect to lockdownd: %s (%d)\n", lockdownd_strerror(lerr), lerr);
+			break;
+		}
+		lerr = lockdownd_start_service(lockdown, HOUSE_ARREST_SERVICE_NAME, &service);
+		if (lerr != LOCKDOWN_E_SUCCESS) {
+			fprintf(stderr, "ERROR: Could not start %s: %s (%d)\n", HOUSE_ARREST_SERVICE_NAME, lockdownd_strerror(lerr), lerr);
+			break;
+		}
+		if (house_arrest_client_new(device, service, &ha) != HOUSE_ARREST_E_SUCCESS || !ha) {
+			fprintf(stderr, "ERROR: Could not start the document sharing service\n");
+			break;
+		}
+		if (house_arrest_send_command(ha, "VendDocuments", appid) != HOUSE_ARREST_E_SUCCESS) {
+			fprintf(stderr, "ERROR: Could not send the house_arrest command\n");
+			break;
+		}
+		plist_t dict = NULL;
+		if (house_arrest_get_result(ha, &dict) != HOUSE_ARREST_E_SUCCESS) {
+			fprintf(stderr, "ERROR: Could not get a result from the document sharing service\n");
+			break;
+		}
+		plist_t node = plist_dict_get_item(dict, "Error");
+		if (node) {
+			char *str = NULL;
+			plist_get_string_val(node, &str);
+			fprintf(stderr, "ERROR: %s\n", str ? str : "unknown");
+			if (str && !strcmp(str, "InstallationLookupFailed")) {
+				fprintf(stderr, "The app '%s' is not installed, or has no File Sharing (UIFileSharingEnabled).\n", appid);
+				ret = 3;
+			}
+			free(str);
+			plist_free(dict);
+			break;
+		}
+		plist_free(dict);
+		if (afc_client_new_from_house_arrest_client(ha, &afc) != AFC_E_SUCCESS || !afc) {
+			fprintf(stderr, "ERROR: Could not open the app's files\n");
+			break;
+		}
+		if (local_mkdir(dest) != 0 && errno != EEXIST) {
+			fprintf(stderr, "ERROR: Could not create %s: %s\n", dest, strerror(errno));
+			break;
+		}
+		copy_tree(afc, "/Documents", dest, "");
+		printf("DONE\t%llu\t%llu\t%llu\t%llu\n", (unsigned long long)n_files, (unsigned long long)n_bytes,
+			(unsigned long long)n_skipped, (unsigned long long)n_errors);
+		fflush(stdout);
+		ret = n_errors ? 2 : 0;
+	} while (0);
+
+	if (afc) afc_client_free(afc);
+	if (ha) house_arrest_client_free(ha);
+	if (service) lockdownd_service_descriptor_free(service);
+	if (lockdown) lockdownd_client_free(lockdown);
+	idevice_free(device);
+	return ret;
+}

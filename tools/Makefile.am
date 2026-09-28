@@ -32,7 +32,8 @@ bin_PROGRAMS = \
 	idevicenotificationproxy \
 	idevicecrashreport \
 	idevicesetlocation \
-	afcclient
+	afcclient \
+	idevicefilesharing
 
 idevicebtlogger_SOURCES = idevicebtlogger.c
 idevicebtlogger_CFLAGS = $(AM_CFLAGS)
@@ -133,6 +134,11 @@ idevicesetlocation_SOURCES = idevicesetlocation.c
 idevicesetlocation_CFLAGS = $(AM_CFLAGS)
 idevicesetlocation_LDFLAGS = $(AM_LDFLAGS)
 idevicesetlocation_LDADD = $(top_builddir)/src/libimobiledevice-1.0.la
+
+idevicefilesharing_SOURCES = idevicefilesharing.c
+idevicefilesharing_CFLAGS = $(AM_CFLAGS)
+idevicefilesharing_LDFLAGS = $(AM_LDFLAGS)
+idevicefilesharing_LDADD = $(top_builddir)/src/libimobiledevice-1.0.la
 
 afcclient_SOURCES = afcclient.c
 afcclient_CFLAGS = $(AM_CFLAGS) $(limd_glue_CFLAGS)
