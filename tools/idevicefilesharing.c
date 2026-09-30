@@ -39,7 +39,12 @@
  *   FILE  <path>  <bytes>
  *   SKIP  <path>  <reason>
  *   ERROR <path>  <message>
- *   DONE  <files> <bytes> <skipped> <errors>
+ *   INBACKUP <path>          (only with --skip-from: not copied)
+ *   DONE  <files> <bytes> <skipped> <errors> [<in-backup>]
+ *
+ * --skip-from FILE lists paths (relative to Documents, separated by NUL
+ * bytes) not to copy — files the device backup already holds — so only
+ * what the backup lacks is collected. Listed files are never opened.
  * Exit status: 0 copied (items may have been skipped), 2 copied with
  * errors, 3 the app has no File Sharing folder (InstallationLookupFailed),
  * 1 anything else (usage, device, service).
@@ -74,7 +79,63 @@
 #include <libimobiledevice/afc.h>
 #include <plist/plist.h>
 
-static uint64_t n_files = 0, n_bytes = 0, n_skipped = 0, n_errors = 0;
+static uint64_t n_files = 0, n_bytes = 0, n_skipped = 0, n_errors = 0, n_inbackup = 0;
+
+/* The --skip-from list, sorted for binary search. */
+static char **skip_paths = NULL;
+static size_t skip_count = 0;
+
+static int cmp_str(const void *a, const void *b)
+{
+	return strcmp(*(char * const *)a, *(char * const *)b);
+}
+
+/* load_skip_list reads NUL-separated paths from path. */
+static int load_skip_list(const char *path)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		return -1;
+	}
+	size_t cap = 0, len = 0;
+	char *buf = NULL;
+	char chunk[65536];
+	size_t n;
+	while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+		if (len + n + 1 > cap) {
+			cap = (len + n + 1) * 2;
+			buf = realloc(buf, cap);
+		}
+		memcpy(buf + len, chunk, n);
+		len += n;
+	}
+	fclose(f);
+	if (!buf) {
+		return 0;
+	}
+	buf[len] = '\0';
+	size_t count = 0;
+	for (size_t i = 0; i < len; i++) {
+		if (buf[i] == '\0') count++;
+	}
+	count++;
+	skip_paths = calloc(count, sizeof(char *));
+	char *p = buf, *end = buf + len;
+	while (p < end) {
+		size_t l = strlen(p);
+		if (l > 0) {
+			skip_paths[skip_count++] = p;
+		}
+		p += l + 1;
+	}
+	qsort(skip_paths, skip_count, sizeof(char *), cmp_str);
+	return 0;
+}
+
+static int in_skip_list(const char *rel)
+{
+	return skip_count > 0 && bsearch(&rel, skip_paths, skip_count, sizeof(char *), cmp_str) != NULL;
+}
 
 /* print_escaped writes s with '%', tab, CR and LF percent-escaped, so a
  * device-supplied file name can't break the line format. */
@@ -248,6 +309,9 @@ static void copy_tree(afc_client_t afc, const char *dev, const char *local, cons
 					copy_tree(afc, child_dev, child_local, child_rel);
 					set_mtime(child_local, mtime);
 				}
+			} else if (ifmt && !strcmp(ifmt, "S_IFREG") && in_skip_list(child_rel)) {
+				report("INBACKUP", child_rel, "");
+				n_inbackup++;
 			} else if (ifmt && !strcmp(ifmt, "S_IFREG")) {
 				int64_t n = copy_file(afc, child_dev, child_local, child_rel);
 				if (n >= 0) {
@@ -277,8 +341,9 @@ static void copy_tree(afc_client_t afc, const char *dev, const char *local, cons
 
 static void print_usage(const char *name)
 {
-	fprintf(stderr, "Usage: %s [-u UDID] BUNDLE_ID DEST_DIR\n\n", name);
+	fprintf(stderr, "Usage: %s [-u UDID] [--skip-from FILE] BUNDLE_ID DEST_DIR\n\n", name);
 	fprintf(stderr, "Copy an app's File Sharing Documents folder to DEST_DIR (created if needed).\n");
+	fprintf(stderr, "  --skip-from FILE   don't copy the paths listed in FILE (NUL-separated, relative to Documents)\n");
 }
 
 int main(int argc, char *argv[])
@@ -287,13 +352,20 @@ int main(int argc, char *argv[])
 	int c;
 	static struct option longopts[] = {
 		{ "udid", required_argument, NULL, 'u' },
+		{ "skip-from", required_argument, NULL, 's' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
-	while ((c = getopt_long(argc, argv, "u:h", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "u:s:h", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'u':
 			udid = optarg;
+			break;
+		case 's':
+			if (load_skip_list(optarg) != 0) {
+				fprintf(stderr, "ERROR: Could not read the skip list %s: %s\n", optarg, strerror(errno));
+				return 1;
+			}
 			break;
 		case 'h':
 			print_usage(argv[0]);
@@ -368,8 +440,8 @@ int main(int argc, char *argv[])
 			break;
 		}
 		copy_tree(afc, "/Documents", dest, "");
-		printf("DONE\t%llu\t%llu\t%llu\t%llu\n", (unsigned long long)n_files, (unsigned long long)n_bytes,
-			(unsigned long long)n_skipped, (unsigned long long)n_errors);
+		printf("DONE\t%llu\t%llu\t%llu\t%llu\t%llu\n", (unsigned long long)n_files, (unsigned long long)n_bytes,
+			(unsigned long long)n_skipped, (unsigned long long)n_errors, (unsigned long long)n_inbackup);
 		fflush(stdout);
 		ret = n_errors ? 2 : 0;
 	} while (0);
