@@ -68,6 +68,7 @@
 #include <sys/statvfs.h>
 #endif
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #define CODE_SUCCESS 0x00
 #define CODE_ERROR_LOCAL 0x06
@@ -79,6 +80,109 @@ static int quit_flag = 0;
 static int passcode_requested = 0;
 
 #define PRINT_VERBOSE(min_level, ...) if (verbose >= min_level) { printf(__VA_ARGS__); };
+
+/*
+ * Protocol trace, for studying what a backup asks of the host (could the
+ * files go straight to an upload instead of a local folder?). Set
+ * IDEVICEBACKUP2_TRACE to a file path and every device request is
+ * appended to it, one tab-separated line each:
+ *
+ *   <seconds since start>  <kind>  <fields...>
+ *
+ * Paths are the backup-relative ones the device names (the hashed
+ * <UDID>/xx/<hash> form, never the device-side file names); '%', tab, CR
+ * and LF in them are percent-escaped.
+ *
+ * IDEVICEBACKUP2_STALL="<files>:<seconds>" additionally stops reading
+ * from the device for <seconds> once <files> files have been received,
+ * to see how long the device tolerates a host that isn't keeping up (a
+ * stalled upload, if files were streamed).
+ */
+static FILE *trace_f = NULL;
+static struct timeval trace_t0;
+static unsigned long trace_files_received = 0;
+static unsigned long stall_after_files = 0;
+static unsigned int stall_seconds = 0;
+static int stall_done = 0;
+
+static void trace_open(void)
+{
+	const char *p = getenv("IDEVICEBACKUP2_TRACE");
+	if (p && *p) {
+		trace_f = fopen(p, "a");
+		if (!trace_f) {
+			fprintf(stderr, "Could not open trace file %s: %s\n", p, strerror(errno));
+		} else {
+			setvbuf(trace_f, NULL, _IOLBF, 0);
+		}
+	}
+	gettimeofday(&trace_t0, NULL);
+	const char *s = getenv("IDEVICEBACKUP2_STALL");
+	if (s && *s) {
+		unsigned long files = 0;
+		unsigned int secs = 0;
+		if (sscanf(s, "%lu:%u", &files, &secs) == 2 && secs > 0) {
+			stall_after_files = files;
+			stall_seconds = secs;
+		}
+	}
+}
+
+/* trace_escape returns str with '%', tab, CR and LF percent-escaped. */
+static const char *trace_escape(const char *str, char *buf, size_t size)
+{
+	size_t o = 0;
+	if (!str) str = "";
+	for (; *str && o + 4 < size; str++) {
+		if (*str == '%' || *str == '\t' || *str == '\r' || *str == '\n') {
+			o += snprintf(buf + o, size - o, "%%%02X", (unsigned char)*str);
+		} else {
+			buf[o++] = *str;
+		}
+	}
+	buf[o] = '\0';
+	return buf;
+}
+
+static void trace(const char *kind, const char *fmt, ...)
+{
+	if (!trace_f) return;
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	double t = (double)(now.tv_sec - trace_t0.tv_sec) + (double)(now.tv_usec - trace_t0.tv_usec) / 1e6;
+	fprintf(trace_f, "%.3f\t%s", t, kind);
+	if (fmt && *fmt) {
+		va_list ap;
+		fputc('\t', trace_f);
+		va_start(ap, fmt);
+		vfprintf(trace_f, fmt, ap);
+		va_end(ap);
+	}
+	fputc('\n', trace_f);
+}
+
+/* trace_path_kind describes what is at a backup-relative path now. */
+static const char *trace_path_kind(const char *backup_dir, const char *rel)
+{
+	struct stat st;
+	char *p = string_build_path(backup_dir, rel, NULL);
+	const char *k = "missing";
+	if (p && stat(p, &st) == 0) {
+		k = S_ISDIR(st.st_mode) ? "dir" : "file";
+	}
+	free(p);
+	return k;
+}
+
+static void stall_if_due(void)
+{
+	if (stall_seconds && !stall_done && trace_files_received >= stall_after_files) {
+		stall_done = 1;
+		trace("STALL_BEGIN", "%lu\t%u", trace_files_received, stall_seconds);
+		sleep(stall_seconds);
+		trace("STALL_END", "");
+	}
+}
 
 enum cmd_mode {
 	CMD_BACKUP,
@@ -1252,6 +1356,15 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	uint32_t bytes = 0;
 	char *localfile = string_build_path(backup_dir, path, NULL);
 	char buf[32768];
+	if (trace_f) {
+		char eb[1024];
+		struct stat tst;
+		if (stat(localfile, &tst) == 0) {
+			trace("SEND", "%s\t%lld", trace_escape(path, eb, sizeof(eb)), (long long)tst.st_size);
+		} else {
+			trace("SEND", "%s\tmissing", trace_escape(path, eb, sizeof(eb)));
+		}
+	}
 #ifdef _WIN32
 	struct _stati64 fst;
 #else
@@ -1515,6 +1628,9 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 	unsigned int file_count = 0;
 	int errcode = 0;
 	char *errdesc = NULL;
+	char trace_name[1024] = "";
+	uint64_t trace_bytes = 0;
+	unsigned int trace_chunks = 0;
 
 	if (!message || (plist_get_node_type(message) != PLIST_ARRAY) || plist_array_get_size(message) < 4 || !backup_dir) return 0;
 
@@ -1553,6 +1669,12 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 		}
 
 		bname = string_build_path(backup_dir, fname, NULL);
+		if (trace_f) {
+			trace_escape(fname, trace_name, sizeof(trace_name));
+			trace("RECV_BEGIN", "%s\t%s", trace_name, trace_path_kind(backup_dir, fname));
+		}
+		trace_bytes = 0;
+		trace_chunks = 0;
 
 		if (fname != NULL) {
 			free(fname);
@@ -1604,6 +1726,8 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			if (bdone == blocksize) {
 				backup_real_size += blocksize;
 			}
+			trace_bytes += bdone;
+			trace_chunks++;
 			if (backup_total_size > 0) {
 				print_progress(backup_real_size, backup_total_size, TRANSFER_RECEIVE);
 			}
@@ -1622,6 +1746,8 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 		if (f) {
 			fclose(f);
 			file_count++;
+			trace_files_received++;
+			trace("RECV", "%s\t%llu\t%u\t%02x", trace_name, (unsigned long long)trace_bytes, trace_chunks, (unsigned char)code);
 		} else {
 			errcode = errno_to_device_error(errno);
 			errdesc = strerror(errno);
@@ -1641,9 +1767,14 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			/* If sent using CODE_FILE_DATA, end marker will be CODE_ERROR_REMOTE which is not an error! */
 			if (last_code != CODE_FILE_DATA) {
 				progress_printf("Received an error message from device: %s\n", msg);
+				if (trace_f) {
+					char eb[1024];
+					trace("RECV_REMOTE_ERROR", "%s\t%s", trace_name, trace_escape(msg, eb, sizeof(eb)));
+				}
 			}
 			free(msg);
 		}
+		stall_if_due();
 	} while (1);
 
 	if (fname != NULL)
@@ -1688,6 +1819,8 @@ static void mb2_handle_list_directory(mobilebackup2_client_t mobilebackup2, plis
 	}
 
 	char *path = string_build_path(backup_dir, str, NULL);
+	char trace_dir[1024];
+	trace_escape(str, trace_dir, sizeof(trace_dir));
 	free(str);
 
 	plist_t dirlist = plist_new_dict();
@@ -1727,6 +1860,7 @@ static void mb2_handle_list_directory(mobilebackup2_client_t mobilebackup2, plis
 		closedir(cur_dir);
 	}
 	free(path);
+	trace("LIST", "%s\t%u", trace_dir, plist_dict_get_size(dirlist));
 
 	/* TODO error handling */
 	mobilebackup2_error_t err = mobilebackup2_send_status_response(mobilebackup2, 0, NULL, dirlist);
@@ -1747,6 +1881,10 @@ static void mb2_handle_make_directory(mobilebackup2_client_t mobilebackup2, plis
 	plist_get_string_val(dir, &str);
 
 	char *newpath = string_build_path(backup_dir, str, NULL);
+	if (trace_f) {
+		char eb[1024];
+		trace("MKDIR", "%s\t%s", trace_escape(str, eb, sizeof(eb)), trace_path_kind(backup_dir, str));
+	}
 	free(str);
 
 	if (mkdir_with_parents(newpath, 0755) < 0) {
@@ -1994,6 +2132,8 @@ int main(int argc, char *argv[])
 	mobilebackup2_client_t mobilebackup2 = NULL;
 	mobilebackup2_error_t err;
 	uint64_t lockfile = 0;
+
+	trace_open();
 
 #define OPT_SYSTEM 1
 #define OPT_REBOOT 2
@@ -2518,6 +2658,7 @@ checkpoint:
 			}
 			remove_file(info_path);
 			plist_write_to_file(info_plist, info_path, PLIST_FORMAT_XML, 0);
+			trace("HOST_WRITE", "Info.plist");
 			free(info_path);
 
 			plist_free(info_plist);
@@ -2783,12 +2924,22 @@ checkpoint:
 				dlmsg = NULL;
 				mberr = mobilebackup2_receive_message(mobilebackup2, &message, &dlmsg);
 				if (mberr == MOBILEBACKUP2_E_RECEIVE_TIMEOUT) {
+					trace("WAIT", "");
 					PRINT_VERBOSE(2, "Device is not ready yet, retrying...\n");
 					goto files_out;
 				} else if (mberr != MOBILEBACKUP2_E_SUCCESS) {
 					PRINT_VERBOSE(0, "ERROR: Could not receive from mobilebackup2 (%d)\n", mberr);
+					trace("RECEIVE_ERROR", "%d", mberr);
 					quit_flag++;
 					goto files_out;
+				}
+
+				if (trace_f) {
+					plist_t a1 = plist_array_get_item(message, 1);
+					uint32_t n = 0;
+					if (a1 && plist_get_node_type(a1) == PLIST_ARRAY) n = plist_array_get_size(a1);
+					else if (a1 && plist_get_node_type(a1) == PLIST_DICT) n = plist_dict_get_size(a1);
+					trace("MSG", "%s\t%u", dlmsg, n);
 				}
 
 				if (!strcmp(dlmsg, "DLMessageDownloadFiles")) {
@@ -2817,6 +2968,7 @@ checkpoint:
 						freespace = (uint64_t)fs.f_bavail * (uint64_t)fs.f_frsize;
 					}
 #endif
+					trace("FREESPACE", "%llu", (unsigned long long)freespace);
 					plist_t freespace_item = plist_new_uint(freespace);
 					mobilebackup2_send_status_response(mobilebackup2, res, NULL, freespace_item);
 					plist_free(freespace_item);
@@ -2851,6 +3003,11 @@ checkpoint:
 								char *str = NULL;
 								plist_get_string_val(val, &str);
 								if (str) {
+									if (trace_f) {
+										char eb1[1024], eb2[1024];
+										const char *sk = trace_path_kind(backup_directory, key);
+										trace("MOVE", "%s\t%s\t%s\t%s", trace_escape(key, eb1, sizeof(eb1)), trace_escape(str, eb2, sizeof(eb2)), sk, trace_path_kind(backup_directory, str));
+									}
 									char *newpath = string_build_path(backup_directory, str, NULL);
 									free(str);
 									char *oldpath = string_build_path(backup_directory, key, NULL);
@@ -2906,6 +3063,10 @@ checkpoint:
 										suppress_warning = 1;
 									}
 								}
+								if (trace_f) {
+									char eb[1024];
+									trace("REMOVE", "%s\t%s", trace_escape(str, eb, sizeof(eb)), trace_path_kind(backup_directory, str));
+								}
 								char *newpath = string_build_path(backup_directory, str, NULL);
 								free(str);
 								int res = 0;
@@ -2945,6 +3106,10 @@ checkpoint:
 							char *newpath = string_build_path(backup_directory, dst, NULL);
 
 							PRINT_VERBOSE(1, "Copying '%s' to '%s'\n", src, dst);
+							if (trace_f) {
+								char eb1[1024], eb2[1024];
+								trace("COPY", "%s\t%s\t%s", trace_escape(src, eb1, sizeof(eb1)), trace_escape(dst, eb2, sizeof(eb2)), trace_path_kind(backup_directory, src));
+							}
 
 							/* check that src exists */
 							if ((stat(oldpath, &st) == 0) && S_ISDIR(st.st_mode)) {
@@ -2966,6 +3131,7 @@ checkpoint:
 						printf("Could not send status response, error %d\n", err);
 					}
 				} else if (!strcmp(dlmsg, "DLMessageDisconnect")) {
+					trace("DISCONNECT", "");
 					break;
 				} else if (!strcmp(dlmsg, "DLMessageProcessMessage")) {
 					node_tmp = plist_array_get_item(message, 1);
@@ -2979,6 +3145,7 @@ checkpoint:
 						uint64_t ec = 0;
 						plist_get_uint_val(nn, &ec);
 						error_code = (uint32_t)ec;
+						trace("PROCESS", "%d", error_code);
 						if (error_code == 0) {
 							operation_ok = 1;
 							result_code = 0;
@@ -3182,6 +3349,8 @@ files_out:
 		source_udid = NULL;
 	}
 
+	trace("END", "%d", result_code);
+	if (trace_f) fclose(trace_f);
 	return result_code;
 }
 
