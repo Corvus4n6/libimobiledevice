@@ -51,6 +51,7 @@
 #include <plist/plist.h>
 
 #include <endianness.h>
+#include "mb2stream.h"
 
 #define LOCK_ATTEMPTS 50
 #define LOCK_WAIT 200000
@@ -78,6 +79,7 @@
 static int verbose = 1;
 static int quit_flag = 0;
 static int passcode_requested = 0;
+static int stream_mode = 0;
 
 #define PRINT_VERBOSE(min_level, ...) if (verbose >= min_level) { printf(__VA_ARGS__); };
 
@@ -1543,6 +1545,13 @@ static void mb2_handle_send_files(mobilebackup2_client_t mobilebackup2, plist_t 
 		if (!str)
 			continue;
 
+		if (stream_mode && mb2s_contains(str)) {
+			progress_printf("ERROR: the device asked to read back %s, which was streamed and isn't on disk\n", str);
+			quit_flag++;
+			free(str);
+			break;
+		}
+
 		if (mb2_handle_send_file(mobilebackup2, backup_dir, str, &errplist) < 0) {
 			free(str);
 			//printf("Error when sending file '%s' to device\n", str);
@@ -1635,6 +1644,7 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 	int errcode = 0;
 	char *errdesc = NULL;
 	char trace_name[1024] = "";
+	int last_streamed = 0;
 	uint64_t trace_bytes = 0;
 	unsigned int trace_chunks = 0;
 
@@ -1681,11 +1691,10 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 		}
 		trace_bytes = 0;
 		trace_chunks = 0;
-
-		if (fname != NULL) {
-			free(fname);
-			fname = NULL;
-		}
+		/* fname stays valid for this file (mb2_receive_filename frees it
+		 * before reading the next name). */
+		int streaming_this = stream_mode && mb2s_is_content_path(fname);
+		last_streamed = streaming_this;
 
 		r = 0;
 		nlen = 0;
@@ -1710,9 +1719,16 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			progress_printf("Found new flag %02x\n", code);
 		}
 
-		remove_file(bname);
-		f = fopen(bname, "wb");
-		while (f && (code == CODE_FILE_DATA)) {
+		int out_ok;
+		if (streaming_this) {
+			f = NULL;
+			out_ok = (mb2s_file_begin(fname) == 0);
+		} else {
+			remove_file(bname);
+			f = fopen(bname, "wb");
+			out_ok = (f != NULL);
+		}
+		while (out_ok && (code == CODE_FILE_DATA)) {
 			blocksize = nlen-1;
 			bdone = 0;
 			rlen = 0;
@@ -1726,7 +1742,15 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 				if ((int)r <= 0) {
 					break;
 				}
-				fwrite(buf, 1, r, f);
+				if (streaming_this) {
+					if (mb2s_file_data(buf, r) < 0) {
+						progress_printf("ERROR: writing the backup stream failed\n");
+						quit_flag++;
+						break;
+					}
+				} else {
+					fwrite(buf, 1, r, f);
+				}
 				bdone += r;
 			}
 			if (bdone == blocksize) {
@@ -1752,8 +1776,15 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 				break;
 			}
 		}
-		if (f) {
-			fclose(f);
+		if (out_ok) {
+			if (streaming_this) {
+				if (mb2s_file_end() < 0) {
+					progress_printf("ERROR: writing the backup stream failed\n");
+					quit_flag++;
+				}
+			} else {
+				fclose(f);
+			}
 			file_count++;
 			trace_files_received++;
 			trace("RECV", "%s\t%llu\t%u\t%02x", trace_name, (unsigned long long)trace_bytes, trace_chunks, (unsigned char)code);
@@ -1776,6 +1807,9 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			/* If sent using CODE_FILE_DATA, end marker will be CODE_ERROR_REMOTE which is not an error! */
 			if (last_code != CODE_FILE_DATA) {
 				progress_printf("Received an error message from device: %s\n", msg);
+				if (stream_mode && fname && mb2s_is_content_path(fname)) {
+					mb2s_file_error(msg);
+				}
 				if (trace_f) {
 					char eb[1024];
 					trace("RECV_REMOTE_ERROR", "%s\t%s", trace_name, trace_escape(msg, eb, sizeof(eb)));
@@ -1797,7 +1831,9 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 		fname = (char*)malloc(nlen-1);
 		mobilebackup2_receive_raw(mobilebackup2, fname, nlen-1, &r);
 		free(fname);
-		remove_file(bname);
+		if (!last_streamed) {
+			remove_file(bname);
+		}
 	}
 
 	/* clean up */
@@ -1812,6 +1848,27 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 	plist_free(empty_plist);
 
 	return file_count;
+}
+
+/* mb2_list_add adds a streamed file (or a folder holding some) to a
+ * DLContentsOfDirectory reply, unless the folder on disk already listed it. */
+static void mb2_list_add(const char *name, int is_dir, uint64_t size, time_t mtime, void *ctx)
+{
+	plist_t dirlist = (plist_t)ctx;
+	if (plist_dict_get_item(dirlist, name)) {
+		return;
+	}
+	plist_t fdict = plist_new_dict();
+	plist_dict_set_item(fdict, "DLFileType", plist_new_string(is_dir ? "DLFileTypeDirectory" : "DLFileTypeRegular"));
+	plist_dict_set_item(fdict, "DLFileSize", plist_new_uint(size));
+	plist_dict_set_item(fdict, "DLFileModificationDate",
+#ifdef HAVE_PLIST_UNIX_DATE
+			    plist_new_unix_date(mtime)
+#else
+			    plist_new_date(mtime - MAC_EPOCH, 0)
+#endif
+	);
+	plist_dict_set_item(dirlist, name, fdict);
 }
 
 static void mb2_handle_list_directory(mobilebackup2_client_t mobilebackup2, plist_t message, const char *backup_dir)
@@ -1832,7 +1889,6 @@ static void mb2_handle_list_directory(mobilebackup2_client_t mobilebackup2, plis
 	char *path = string_build_path(backup_dir, str, NULL);
 	char trace_dir[1024];
 	trace_escape(str, trace_dir, sizeof(trace_dir));
-	free(str);
 
 	plist_t dirlist = plist_new_dict();
 
@@ -1870,6 +1926,11 @@ static void mb2_handle_list_directory(mobilebackup2_client_t mobilebackup2, plis
 		}
 		closedir(cur_dir);
 	}
+	if (stream_mode) {
+		/* streamed files aren't on disk: list them from the index */
+		mb2s_list(str, mb2_list_add, dirlist);
+	}
+	free(str);
 	free(path);
 	trace("LIST", "%s\t%u", trace_dir, plist_dict_get_size(dirlist));
 
@@ -2081,6 +2142,9 @@ static void print_usage(int argc, char **argv, int is_error)
 		"CMD:\n"
 		"  backup        create backup for the device\n"
 		"    --full              force full backup from device.\n"
+		"    --stream            backup only: send the backup's content files to stdout\n"
+		"                        as a record stream (see tools/mb2stream.h); progress\n"
+		"                        and messages go to stderr\n"
 		"  restore       restore last backup to the device\n"
 		"    --system            restore system files, too.\n"
 		"    --no-reboot         do NOT reboot the device when done (default: yes).\n"
@@ -2155,6 +2219,7 @@ int main(int argc, char *argv[])
 #define OPT_SKIP_APPS 7
 #define OPT_PASSWORD 8
 #define OPT_FULL 9
+#define OPT_STREAM 10
 
 	int c = 0;
 	const struct option longopts[] = {
@@ -2175,6 +2240,7 @@ int main(int argc, char *argv[])
 		{ "skip-apps", no_argument, NULL, OPT_SKIP_APPS },
 		{ "password", required_argument, NULL, OPT_PASSWORD },
 		{ "full", no_argument, NULL, OPT_FULL },
+		{ "stream", no_argument, NULL, OPT_STREAM },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -2247,6 +2313,9 @@ int main(int argc, char *argv[])
 			break;
 		case OPT_FULL:
 			cmd_flags |= CMD_FLAG_FORCE_FULL_BACKUP;
+			break;
+		case OPT_STREAM:
+			stream_mode = 1;
 			break;
 		default:
 			print_usage(argc, argv, 1);
@@ -2359,6 +2428,17 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "ERROR: Unsupported command '%s'.\n", argv[0]);
 		print_usage(argc+optind, argv-optind, 1);
 		return 2;
+	}
+
+	if (stream_mode) {
+		if (cmd != CMD_BACKUP) {
+			fprintf(stderr, "ERROR: --stream only works with the backup command.\n");
+			return 2;
+		}
+		if (mb2s_open_stdout() < 0) {
+			fprintf(stderr, "ERROR: could not set up the backup stream: %s\n", strerror(errno));
+			return 2;
+		}
 	}
 
 	if (cmd == CMD_CHANGEPW || cmd == CMD_CLOUD) {
@@ -2979,6 +3059,11 @@ checkpoint:
 						freespace = (uint64_t)fs.f_bavail * (uint64_t)fs.f_frsize;
 					}
 #endif
+					if (stream_mode && res == 0) {
+						/* the backup's content isn't written here: don't let the
+						 * device refuse the backup for lack of local space */
+						freespace += (uint64_t)16 << 40;
+					}
 					trace("FREESPACE", "%llu", (unsigned long long)freespace);
 					plist_t freespace_item = plist_new_uint(freespace);
 					mobilebackup2_send_status_response(mobilebackup2, res, NULL, freespace_item);
@@ -3019,6 +3104,16 @@ checkpoint:
 										const char *sk = trace_path_kind(backup_directory, key);
 										trace("MOVE", "%s\t%s\t%s\t%s", trace_escape(key, eb1, sizeof(eb1)), trace_escape(str, eb2, sizeof(eb2)), sk, trace_path_kind(backup_directory, str));
 									}
+									if (stream_mode && mb2s_contains(key)) {
+										if (mb2s_move(key, str) < 0) {
+											errcode = -1;
+											errdesc = "writing the backup stream failed";
+											free(str);
+											free(key);
+											key = NULL;
+											break;
+										}
+									}
 									char *newpath = string_build_path(backup_directory, str, NULL);
 									free(str);
 									char *oldpath = string_build_path(backup_directory, key, NULL);
@@ -3027,7 +3122,7 @@ checkpoint:
 										rmdir_recursive(newpath);
 									else
 										remove_file(newpath);
-									if (rename(oldpath, newpath) < 0) {
+									if (rename(oldpath, newpath) < 0 && !(stream_mode && errno == ENOENT)) {
 										printf("Renameing '%s' to '%s' failed: %s (%d)\n", oldpath, newpath, strerror(errno), errno);
 										errcode = errno_to_device_error(errno);
 										errdesc = strerror(errno);
@@ -3078,6 +3173,10 @@ checkpoint:
 									char eb[1024];
 									trace("REMOVE", "%s\t%s", trace_escape(str, eb, sizeof(eb)), trace_path_kind(backup_directory, str));
 								}
+								if (stream_mode && mb2s_remove(str) < 0) {
+									errcode = -1;
+									errdesc = "writing the backup stream failed";
+								}
 								char *newpath = string_build_path(backup_directory, str, NULL);
 								free(str);
 								int res = 0;
@@ -3123,7 +3222,12 @@ checkpoint:
 							}
 
 							/* check that src exists */
-							if ((stat(oldpath, &st) == 0) && S_ISDIR(st.st_mode)) {
+							if (stream_mode && mb2s_contains(src)) {
+								progress_printf("ERROR: the device asked to copy %s, which was streamed and isn't on disk\n", src);
+								errcode = -1;
+								errdesc = "item was streamed, not stored";
+								quit_flag++;
+							} else if ((stat(oldpath, &st) == 0) && S_ISDIR(st.st_mode)) {
 								mb2_copy_directory_by_path(oldpath, newpath);
 							} else if ((stat(oldpath, &st) == 0) && S_ISREG(st.st_mode)) {
 								mb2_copy_file_by_path(oldpath, newpath);
@@ -3243,9 +3347,14 @@ files_out:
 				break;
 				case CMD_BACKUP:
 					PRINT_VERBOSE(1, "Received %d files from device.\n", file_count);
-					if (operation_ok && mb2_status_check_snapshot_state(backup_directory, udid, "finished")) {
+					if (operation_ok && mb2_status_check_snapshot_state(backup_directory, udid, "finished")
+					    && (!stream_mode || mb2s_finish() == 0)) {
 						PRINT_VERBOSE(1, "Backup Successful.\n");
 					} else {
+						if (stream_mode && mb2s_failed()) {
+							PRINT_VERBOSE(0, "ERROR: the backup stream could not be written.\n");
+							result_code = -1;
+						}
 						if (quit_flag) {
 							PRINT_VERBOSE(1, "Backup Aborted.\n");
 						} else {
