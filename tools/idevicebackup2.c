@@ -96,7 +96,9 @@ static int passcode_requested = 0;
  * IDEVICEBACKUP2_STALL="<files>:<seconds>" additionally stops reading
  * from the device for <seconds> once <files> files have been received,
  * to see how long the device tolerates a host that isn't keeping up (a
- * stalled upload, if files were streamed).
+ * stalled upload, if files were streamed). "<files>:<seconds>:mid" pauses
+ * inside a file's data instead, after the second chunk of the next file
+ * that has one.
  */
 static FILE *trace_f = NULL;
 static struct timeval trace_t0;
@@ -104,6 +106,7 @@ static unsigned long trace_files_received = 0;
 static unsigned long stall_after_files = 0;
 static unsigned int stall_seconds = 0;
 static int stall_done = 0;
+static int stall_mid = 0;
 
 static void trace_open(void)
 {
@@ -121,9 +124,12 @@ static void trace_open(void)
 	if (s && *s) {
 		unsigned long files = 0;
 		unsigned int secs = 0;
-		if (sscanf(s, "%lu:%u", &files, &secs) == 2 && secs > 0) {
+		char where[8] = "";
+		int n = sscanf(s, "%lu:%u:%7s", &files, &secs, where);
+		if (n >= 2 && secs > 0) {
 			stall_after_files = files;
 			stall_seconds = secs;
+			stall_mid = (n == 3 && strcmp(where, "mid") == 0);
 		}
 	}
 }
@@ -1728,6 +1734,9 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			}
 			trace_bytes += bdone;
 			trace_chunks++;
+			if (stall_mid && trace_chunks == 2) {
+				stall_if_due();
+			}
 			if (backup_total_size > 0) {
 				print_progress(backup_real_size, backup_total_size, TRANSFER_RECEIVE);
 			}
@@ -1774,7 +1783,9 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			}
 			free(msg);
 		}
-		stall_if_due();
+		if (!stall_mid) {
+			stall_if_due();
+		}
 	} while (1);
 
 	if (fname != NULL)
