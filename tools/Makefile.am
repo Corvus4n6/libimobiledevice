@@ -70,7 +70,7 @@ idevicebackup_CFLAGS = $(AM_CFLAGS) $(limd_glue_CFLAGS)
 idevicebackup_LDFLAGS = $(AM_LDFLAGS) $(limd_glue_LIBS)
 idevicebackup_LDADD = $(top_builddir)/src/libimobiledevice-1.0.la
 
-idevicebackup2_SOURCES = idevicebackup2.c
+idevicebackup2_SOURCES = idevicebackup2.c mb2stream.c mb2stream.h
 idevicebackup2_CFLAGS = $(AM_CFLAGS) $(limd_glue_CFLAGS)
 idevicebackup2_LDFLAGS = $(AM_LDFLAGS) $(limd_glue_LIBS)
 idevicebackup2_LDADD = $(top_builddir)/src/libimobiledevice-1.0.la
