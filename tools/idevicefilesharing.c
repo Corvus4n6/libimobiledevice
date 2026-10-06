@@ -45,6 +45,11 @@
  * --skip-from FILE lists paths (relative to Documents, separated by NUL
  * bytes) not to copy — files the device backup already holds — so only
  * what the backup lacks is collected. Listed files are never opened.
+ * --stream sends the files to stdout as records instead of writing
+ * DEST_DIR (see mb2stream.h: F/T/D/E per file, X after E for a device
+ * read error, S per item left out, Z with the totals); everything
+ * human-readable goes to stderr. --skip-from - reads the list from stdin.
+ *
  * Exit status: 0 copied (items may have been skipped), 2 copied with
  * errors, 3 the app has no File Sharing folder (InstallationLookupFailed),
  * 1 anything else (usage, device, service).
@@ -68,6 +73,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
+#include <io.h>
+#include <fcntl.h>
 #define local_mkdir(p) _mkdir(p)
 #else
 #define local_mkdir(p) mkdir(p, 0700)
@@ -79,6 +86,9 @@
 #include <libimobiledevice/afc.h>
 #include <plist/plist.h>
 
+#include "mb2stream.h"
+
+static int stream_mode = 0;
 static uint64_t n_files = 0, n_bytes = 0, n_skipped = 0, n_errors = 0, n_inbackup = 0;
 
 /* The --skip-from list, sorted for binary search. */
@@ -93,7 +103,15 @@ static int cmp_str(const void *a, const void *b)
 /* load_skip_list reads NUL-separated paths from path. */
 static int load_skip_list(const char *path)
 {
-	FILE *f = fopen(path, "rb");
+	FILE *f;
+	if (!strcmp(path, "-")) {
+#ifdef _WIN32
+		_setmode(_fileno(stdin), _O_BINARY);
+#endif
+		f = stdin;
+	} else {
+		f = fopen(path, "rb");
+	}
 	if (!f) {
 		return -1;
 	}
@@ -109,7 +127,9 @@ static int load_skip_list(const char *path)
 		memcpy(buf + len, chunk, n);
 		len += n;
 	}
-	fclose(f);
+	if (f != stdin) {
+		fclose(f);
+	}
 	if (!buf) {
 		return 0;
 	}
@@ -154,6 +174,13 @@ static void print_escaped(const char *s)
 
 static void report(const char *kind, const char *rel, const char *detail)
 {
+	if (stream_mode) {
+		/* FILE is the F/T/D/E records themselves. */
+		if (!strcmp(kind, "SKIP")) mb2s_skip(rel, detail, 's');
+		else if (!strcmp(kind, "ERROR")) mb2s_skip(rel, detail, 'e');
+		else if (!strcmp(kind, "INBACKUP")) mb2s_skip(rel, "", 'b');
+		return;
+	}
 	fputs(kind, stdout);
 	fputc('\t', stdout);
 	print_escaped(rel);
@@ -202,13 +229,49 @@ static char *join(const char *a, const char *b)
 /* copy_file copies one regular device file to local; returns bytes copied
  * or -1 after reporting an error. The device file is only ever opened
  * read-only. */
-static int64_t copy_file(afc_client_t afc, const char *dev, const char *local, const char *rel)
+static int64_t copy_file(afc_client_t afc, const char *dev, const char *local, const char *rel, const char *mtime_ns)
 {
 	uint64_t fh = 0;
 	afc_error_t err = afc_file_open(afc, dev, AFC_FOPEN_RDONLY, &fh);
 	if (err != AFC_E_SUCCESS) {
 		report_error(rel, "opening on the device failed: %s (%d)", afc_strerror(err), err);
 		return -1;
+	}
+	if (stream_mode) {
+		size_t bs = 0x100000;
+		char *b = malloc(bs);
+		int64_t sent = 0;
+		int good = 1;
+		mb2s_file_begin(rel);
+		mb2s_mtime(mtime_ns ? strtoull(mtime_ns, NULL, 10) / 1000000000ULL : 0);
+		while (1) {
+			uint32_t got = 0;
+			err = afc_file_read(afc, fh, b, bs, &got);
+			if (err != AFC_E_SUCCESS) {
+				char msg[256];
+				snprintf(msg, sizeof(msg), "reading from the device failed: %s (%d)", afc_strerror(err), err);
+				mb2s_file_end();
+				mb2s_file_error(msg);
+				report_error(rel, "reading from the device failed: %s (%d)", afc_strerror(err), err);
+				good = 0;
+				break;
+			}
+			if (got == 0) {
+				break;
+			}
+			if (mb2s_file_data(b, got) < 0) {
+				fprintf(stderr, "ERROR: writing the stream failed\n");
+				good = 0;
+				break;
+			}
+			sent += got;
+		}
+		free(b);
+		afc_file_close(afc, fh);
+		if (good && mb2s_file_end() < 0) {
+			good = 0;
+		}
+		return good ? sent : -1;
 	}
 	FILE *f = fopen(local, "wb");
 	if (!f) {
@@ -283,7 +346,7 @@ static void copy_tree(afc_client_t afc, const char *dev, const char *local, cons
 			continue;
 		}
 		char *child_dev = join(dev, *p);
-		char *child_local = join(local, *p);
+		char *child_local = local ? join(local, *p) : NULL;
 
 		char **info = NULL;
 		const char *ifmt = NULL, *size = NULL, *mtime = NULL;
@@ -302,7 +365,9 @@ static void copy_tree(afc_client_t afc, const char *dev, const char *local, cons
 				else if (!strcmp(kv[0], "st_mtime")) mtime = kv[1];
 			}
 			(void)size;
-			if (ifmt && !strcmp(ifmt, "S_IFDIR")) {
+			if (ifmt && !strcmp(ifmt, "S_IFDIR") && stream_mode) {
+				copy_tree(afc, child_dev, NULL, child_rel);
+			} else if (ifmt && !strcmp(ifmt, "S_IFDIR")) {
 				if (local_mkdir(child_local) != 0 && errno != EEXIST) {
 					report_error(child_rel, "creating the local folder failed: %s (%d)", strerror(errno), errno);
 				} else {
@@ -313,14 +378,16 @@ static void copy_tree(afc_client_t afc, const char *dev, const char *local, cons
 				report("INBACKUP", child_rel, "");
 				n_inbackup++;
 			} else if (ifmt && !strcmp(ifmt, "S_IFREG")) {
-				int64_t n = copy_file(afc, child_dev, child_local, child_rel);
+				int64_t n = copy_file(afc, child_dev, child_local, child_rel, mtime);
 				if (n >= 0) {
 					char num[32];
 					snprintf(num, sizeof(num), "%lld", (long long)n);
 					report("FILE", child_rel, num);
 					n_files++;
 					n_bytes += (uint64_t)n;
-					set_mtime(child_local, mtime);
+					if (!stream_mode) {
+						set_mtime(child_local, mtime);
+					}
 				}
 			} else {
 				char why[64];
@@ -341,9 +408,11 @@ static void copy_tree(afc_client_t afc, const char *dev, const char *local, cons
 
 static void print_usage(const char *name)
 {
-	fprintf(stderr, "Usage: %s [-u UDID] [--skip-from FILE] BUNDLE_ID DEST_DIR\n\n", name);
+	fprintf(stderr, "Usage: %s [-u UDID] [--skip-from FILE|-] BUNDLE_ID DEST_DIR\n", name);
+	fprintf(stderr, "       %s [-u UDID] [--skip-from FILE|-] --stream BUNDLE_ID\n\n", name);
 	fprintf(stderr, "Copy an app's File Sharing Documents folder to DEST_DIR (created if needed).\n");
-	fprintf(stderr, "  --skip-from FILE   don't copy the paths listed in FILE (NUL-separated, relative to Documents)\n");
+	fprintf(stderr, "  --skip-from FILE   don't copy the paths listed in FILE (NUL-separated, relative to Documents; - for stdin)\n");
+	fprintf(stderr, "  --stream           write the files to stdout as records instead of DEST_DIR\n");
 }
 
 int main(int argc, char *argv[])
@@ -353,10 +422,11 @@ int main(int argc, char *argv[])
 	static struct option longopts[] = {
 		{ "udid", required_argument, NULL, 'u' },
 		{ "skip-from", required_argument, NULL, 's' },
+		{ "stream", no_argument, NULL, 'S' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
-	while ((c = getopt_long(argc, argv, "u:s:h", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "u:s:hS", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'u':
 			udid = optarg;
@@ -367,6 +437,9 @@ int main(int argc, char *argv[])
 				return 1;
 			}
 			break;
+		case 'S':
+			stream_mode = 1;
+			break;
 		case 'h':
 			print_usage(argv[0]);
 			return 0;
@@ -375,12 +448,16 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
-	if (argc - optind != 2) {
+	if (argc - optind != (stream_mode ? 1 : 2)) {
 		print_usage(argv[0]);
 		return 1;
 	}
 	const char *appid = argv[optind];
-	const char *dest = argv[optind + 1];
+	const char *dest = stream_mode ? NULL : argv[optind + 1];
+	if (stream_mode && mb2s_open_stdout() < 0) {
+		fprintf(stderr, "ERROR: Could not set up the output stream\n");
+		return 1;
+	}
 
 	idevice_t device = NULL;
 	lockdownd_client_t lockdown = NULL;
@@ -433,6 +510,15 @@ int main(int argc, char *argv[])
 		plist_free(dict);
 		if (afc_client_new_from_house_arrest_client(ha, &afc) != AFC_E_SUCCESS || !afc) {
 			fprintf(stderr, "ERROR: Could not open the app's files\n");
+			break;
+		}
+		if (stream_mode) {
+			copy_tree(afc, "/Documents", NULL, "");
+			if (mb2s_end_totals((uint32_t)n_files, n_bytes) < 0) {
+				fprintf(stderr, "ERROR: writing the stream failed\n");
+				break;
+			}
+			ret = n_errors ? 2 : 0;
 			break;
 		}
 		if (local_mkdir(dest) != 0 && errno != EEXIST) {

@@ -398,6 +398,24 @@ void mb2s_list(const char *dir, mb2s_list_cb cb, void *ctx)
 	free(d);
 }
 
+int mb2s_mtime(uint64_t t)
+{
+	return put_u8('T') < 0 || put_u64(t) < 0 ? -1 : 0;
+}
+
+int mb2s_skip(const char *path, const char *reason, char kind)
+{
+	if (put_u8('S') < 0 || put_str(path, 1) < 0 || put_str(reason ? reason : "", 1) < 0 || put_u8((uint8_t)kind) < 0)
+		return -1;
+	return 0;
+}
+
+int mb2s_end_totals(uint32_t files, uint64_t bytes)
+{
+	if (put_u8('Z') < 0 || put_u32(files) < 0 || put_u64(bytes) < 0 || flush_out() < 0) return -1;
+	return failed ? -1 : 0;
+}
+
 int mb2s_finish(void)
 {
 	if (put_u8('Z') < 0 || flush_out() < 0) return -1;

@@ -43,6 +43,8 @@
 #include <libimobiledevice/afc.h>
 #include <plist/plist.h>
 
+#include "mb2stream.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #define S_IFLNK S_IFREG
@@ -56,6 +58,10 @@ const char* target_directory = NULL;
 static int extract_raw_crash_reports = 0;
 static int keep_crash_reports = 0;
 static int remove_all = 0;
+/* --stream: reports go to stdout as records (see mb2stream.h), not DIRECTORY. */
+static int stream_mode = 0;
+static uint32_t stream_files = 0;
+static uint64_t stream_bytes = 0;
 
 static int file_exists(const char* path)
 {
@@ -106,8 +112,9 @@ static int extract_raw_crash_report(const char* filename)
 	return res;
 }
 
-static int afc_client_copy_and_remove_crash_reports(afc_client_t afc, const char* device_directory, const char* host_directory, const char* filename_filter)
+static int afc_client_copy_and_remove_crash_reports(afc_client_t afc, const char* device_directory, const char* host_directory, const char* filename_filter, const char* rel_prefix)
 {
+	char rel[1024];
 	afc_error_t afc_error;
 	int k;
 	int res = -1;
@@ -172,6 +179,8 @@ static int afc_client_copy_and_remove_crash_reports(afc_client_t afc, const char
 			strcpy(((char*)target_filename) + host_directory_length, list[k]);
 		}
 
+		snprintf(rel, sizeof(rel), "%s%s", rel_prefix, (char*)target_filename + host_directory_length);
+
 		/* get file information */
 		afc_get_file_info_plist(afc, source_filename, &fileinfo);
 		if (!fileinfo) {
@@ -202,7 +211,10 @@ static int afc_client_copy_and_remove_crash_reports(afc_client_t afc, const char
 		stbuf.st_nlink = plist_dict_get_uint(fileinfo, "st_nlink");
 		stbuf.st_mtime = (time_t)(plist_dict_get_uint(fileinfo, "st_mtime") / 1000000000);
 		const char* linktarget = plist_get_string_ptr(plist_dict_get_item(fileinfo, "LinkTarget"), NULL);
-		if (linktarget && !remove_all) {
+		if (linktarget && !remove_all && stream_mode) {
+			mb2s_skip(rel, "symlink to the latest report", 's');
+			res = 0;
+		} else if (linktarget && !remove_all) {
 			/* report latest crash report filename */
 			printf("Link: %s\n", (char*)target_filename + strlen(target_directory));
 
@@ -237,14 +249,16 @@ static int afc_client_copy_and_remove_crash_reports(afc_client_t afc, const char
 
 		/* recurse into child directories */
 		if (S_ISDIR(stbuf.st_mode)) {
-			if (!remove_all) {
+			if (!remove_all && !stream_mode) {
 #ifdef _WIN32
 				mkdir(target_filename);
 #else
 				mkdir(target_filename, 0755);
 #endif
 			}
-			res = afc_client_copy_and_remove_crash_reports(afc, source_filename, target_filename, filename_filter);
+			char child_prefix[1024];
+			snprintf(child_prefix, sizeof(child_prefix), "%s/", rel);
+			res = afc_client_copy_and_remove_crash_reports(afc, source_filename, target_filename, filename_filter, child_prefix);
 
 			/* remove directory from device */
 			if (!remove_all && !keep_crash_reports)
@@ -267,6 +281,32 @@ static int afc_client_copy_and_remove_crash_reports(afc_client_t afc, const char
 					continue;
 				}
 				fprintf(stderr, "Unable to open device file '%s' (%d). Skipping...\n", source_filename, afc_error);
+				continue;
+			}
+
+			if (stream_mode) {
+				uint32_t got = 0;
+				uint64_t total = 0;
+				char sbuf[0x10000];
+				mb2s_file_begin(rel);
+				mb2s_mtime((uint64_t)stbuf.st_mtime);
+				afc_error = afc_file_read(afc, handle, sbuf, sizeof(sbuf), &got);
+				while (afc_error == AFC_E_SUCCESS && got > 0) {
+					mb2s_file_data(sbuf, got);
+					total += got;
+					afc_error = afc_file_read(afc, handle, sbuf, sizeof(sbuf), &got);
+				}
+				afc_file_close(afc, handle);
+				mb2s_file_end();
+				if ((uint64_t)stbuf.st_size != total) {
+					mb2s_file_error("file size mismatch");
+					mb2s_skip(rel, "file size mismatch", 'e');
+					continue;
+				}
+				stream_files++;
+				stream_bytes += total;
+				crash_report_count++;
+				res = 0;
 				continue;
 			}
 
@@ -334,6 +374,7 @@ static void print_usage(int argc, char **argv, int is_error)
 		"  -n, --network         connect to network device\n"
 		"  -e, --extract         extract raw crash report into separate '.crash' file\n"
 		"  -k, --keep            copy but do not remove crash reports from device\n"
+		"  --stream              with -k: write reports to stdout as records instead of DIRECTORY\n"
 		"  -d, --debug           enable communication debugging\n"
 		"  -f, --filter NAME     filter crash reports by NAME (case sensitive)\n"
 		"  -h, --help            prints usage information\n"
@@ -370,6 +411,7 @@ int main(int argc, char* argv[])
 		{ "extract", no_argument, NULL, 'e' },
 		{ "keep", no_argument, NULL, 'k' },
 		{ "remove-all", no_argument, NULL, 1 },
+		{ "stream", no_argument, NULL, 2 },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -417,6 +459,9 @@ int main(int argc, char* argv[])
 		case 1:
 			remove_all = 1;
 			break;
+		case 2:
+			stream_mode = 1;
+			break;
 		default:
 			print_usage(argc, argv, 1);
 			return 2;
@@ -425,6 +470,17 @@ int main(int argc, char* argv[])
 	argc -= optind;
 	argv += optind;
 
+	if (stream_mode) {
+		if (!keep_crash_reports || remove_all) {
+			fprintf(stderr, "ERROR: --stream needs --keep (and not --remove-all)\n");
+			return 2;
+		}
+		if (mb2s_open_stdout() < 0) {
+			fprintf(stderr, "ERROR: Could not set up the output stream\n");
+			return 1;
+		}
+		target_directory = ".";
+	} else
 	/* ensure a target directory was supplied */
 	if (!remove_all) {
 		if (!argv[0]) {
@@ -438,7 +494,7 @@ int main(int argc, char* argv[])
 	}
 
 	/* check if target directory exists */
-	if (!file_exists(target_directory)) {
+	if (!stream_mode && !file_exists(target_directory)) {
 		fprintf(stderr, "ERROR: Directory '%s' does not exist.\n", target_directory);
 		return 1;
 	}
@@ -529,13 +585,17 @@ int main(int argc, char* argv[])
 	}
 
 	/* recursively copy crash reports from the device to a local directory */
-	if (afc_client_copy_and_remove_crash_reports(afc, ".", target_directory, filename_filter) < 0) {
+	if (afc_client_copy_and_remove_crash_reports(afc, ".", target_directory, filename_filter, "") < 0) {
 		fprintf(stderr, "ERROR: Failed to get crash reports from device.\n");
 		afc_client_free(afc);
 		idevice_free(device);
 		return -1;
 	}
 
+	if (stream_mode && mb2s_end_totals(stream_files, stream_bytes) < 0) {
+		fprintf(stderr, "ERROR: writing the stream failed\n");
+		return 1;
+	}
 	printf("Done.\n");
 
 	afc_client_free(afc);

@@ -16,6 +16,13 @@
  *   'M' u16 len, from, u16 len, to   the device moved a streamed path
  *   'R' u16 len, path      the device removed a streamed path
  *   'Z'                    end of stream (written only when the backup succeeded)
+ *
+ * Tool streams (idevicefilesharing, idevicecrashreport --stream) use the
+ * same F/D/E/X records plus:
+ *   'T' u64 seconds        the file's modification time (right after 'F')
+ *   'S' u16 len, path, u16 len, reason, u8 kind   an item left out
+ *                          ('s' skipped, 'e' couldn't be copied, 'b' in the backup)
+ *   'Z' u32 files, u64 bytes   end, with the totals
  */
 #ifndef MB2STREAM_H
 #define MB2STREAM_H
@@ -32,6 +39,11 @@ int mb2s_file_begin(const char *name);
 int mb2s_file_data(const char *buf, uint32_t len);
 int mb2s_file_end(void);
 int mb2s_file_error(const char *msg);
+
+/* Tool streams (idevicefilesharing, idevicecrashreport --stream). */
+int mb2s_mtime(uint64_t unix_seconds);                              /* 'T' u64, after 'F' */
+int mb2s_skip(const char *path, const char *reason, char kind);     /* 'S' path, reason, u8 kind: 's' skipped, 'e' error, 'b' in backup */
+int mb2s_end_totals(uint32_t files, uint64_t bytes);                /* 'Z' u32 files, u64 bytes, then flush */
 
 int mb2s_move(const char *from, const char *to);
 int mb2s_remove(const char *path);

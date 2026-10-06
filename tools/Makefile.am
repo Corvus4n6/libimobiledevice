@@ -125,7 +125,7 @@ idevicenotificationproxy_CFLAGS = $(AM_CFLAGS)
 idevicenotificationproxy_LDFLAGS = $(AM_LDFLAGS)
 idevicenotificationproxy_LDADD = $(top_builddir)/src/libimobiledevice-1.0.la
 
-idevicecrashreport_SOURCES = idevicecrashreport.c
+idevicecrashreport_SOURCES = idevicecrashreport.c mb2stream.c mb2stream.h
 idevicecrashreport_CFLAGS = $(AM_CFLAGS) $(limd_glue_CFLAGS)
 idevicecrashreport_LDFLAGS = $(AM_LDFLAGS) $(limd_glue_LIBS)
 idevicecrashreport_LDADD = $(top_builddir)/src/libimobiledevice-1.0.la
@@ -135,7 +135,7 @@ idevicesetlocation_CFLAGS = $(AM_CFLAGS)
 idevicesetlocation_LDFLAGS = $(AM_LDFLAGS)
 idevicesetlocation_LDADD = $(top_builddir)/src/libimobiledevice-1.0.la
 
-idevicefilesharing_SOURCES = idevicefilesharing.c
+idevicefilesharing_SOURCES = idevicefilesharing.c mb2stream.c mb2stream.h
 idevicefilesharing_CFLAGS = $(AM_CFLAGS)
 idevicefilesharing_LDFLAGS = $(AM_LDFLAGS)
 idevicefilesharing_LDADD = $(top_builddir)/src/libimobiledevice-1.0.la
