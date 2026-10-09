@@ -240,6 +240,11 @@ static int64_t copy_file(afc_client_t afc, const char *dev, const char *local, c
 	if (stream_mode) {
 		size_t bs = 0x100000;
 		char *b = malloc(bs);
+		if (!b) {
+			afc_file_close(afc, fh);
+			report_error(rel, "out of memory (%s, %d)", "malloc", 0);
+			return -1;
+		}
 		int64_t sent = 0;
 		int good = 1;
 		mb2s_file_begin(rel);
@@ -281,6 +286,12 @@ static int64_t copy_file(afc_client_t afc, const char *dev, const char *local, c
 	}
 	size_t bufsize = 0x100000;
 	char *buf = malloc(bufsize);
+	if (!buf) {
+		fclose(f);
+		afc_file_close(afc, fh);
+		report_error(rel, "out of memory (%s, %d)", "malloc", 0);
+		return -1;
+	}
 	int64_t total = 0;
 	int ok = 1;
 	while (1) {
