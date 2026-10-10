@@ -504,8 +504,19 @@ int main(int argc, char *argv[])
 			const char *path = argv[i];
 			char **info = NULL;
 			const char *ifmt = NULL, *mtime = NULL;
-			if (afc_get_file_info(afc, path, &info) != AFC_E_SUCCESS || !info) {
-				mb2s_skip(path, "not found", 's');
+			afc_error_t ierr = afc_get_file_info(afc, path, &info);
+			if (ierr != AFC_E_SUCCESS || !info) {
+				/* Only a genuinely missing file is "not found" ('s'); any
+				 * other failure is an error ('e'), so a caller never
+				 * mistakes an unreadable file for an absent one. */
+				if (ierr == AFC_E_OBJECT_NOT_FOUND) {
+					mb2s_skip(path, "not found", 's');
+				} else {
+					char msg[128];
+					snprintf(msg, sizeof(msg), "reading file information failed: %s (%d)", afc_strerror(ierr), ierr);
+					mb2s_skip(path, msg, 'e');
+					n_errors++;
+				}
 				continue;
 			}
 			for (char **kv = info; kv[0] && kv[1]; kv += 2) {
