@@ -1547,6 +1547,13 @@ static void mb2_handle_send_files(mobilebackup2_client_t mobilebackup2, plist_t 
 
 		if (stream_mode && mb2s_contains(str)) {
 			progress_printf("ERROR: the device asked to read back %s, which was streamed and isn't on disk\n", str);
+			/* Tell the device the truth (a per-file error in a
+			 * multi-status response), rather than success; the backup
+			 * stops here either way. */
+			if (!errplist) {
+				errplist = plist_new_dict();
+			}
+			mb2_multi_status_add_file_error(errplist, str, errno_to_device_error(ENOENT), "streamed to the collection, not kept on disk");
 			quit_flag++;
 			free(str);
 			break;
@@ -3104,7 +3111,13 @@ checkpoint:
 										const char *sk = trace_path_kind(backup_directory, key);
 										trace("MOVE", "%s\t%s\t%s\t%s", trace_escape(key, eb1, sizeof(eb1)), trace_escape(str, eb2, sizeof(eb2)), sk, trace_path_kind(backup_directory, str));
 									}
-									if (stream_mode && mb2s_contains(key)) {
+									/* A streamed file, or a folder holding streamed
+									 * files, isn't on disk, so its rename may find
+									 * nothing (ENOENT) and that's expected. Anything
+									 * else missing is a real error, as without
+									 * --stream: never silently skip, say, Manifest.db. */
+									int streamed_src = stream_mode && mb2s_contains(key);
+									if (streamed_src) {
 										if (mb2s_move(key, str) < 0) {
 											errcode = -1;
 											errdesc = "writing the backup stream failed";
@@ -3122,7 +3135,7 @@ checkpoint:
 										rmdir_recursive(newpath);
 									else
 										remove_file(newpath);
-									if (rename(oldpath, newpath) < 0 && !(stream_mode && errno == ENOENT)) {
+									if (rename(oldpath, newpath) < 0 && !(streamed_src && errno == ENOENT)) {
 										printf("Renameing '%s' to '%s' failed: %s (%d)\n", oldpath, newpath, strerror(errno), errno);
 										errcode = errno_to_device_error(errno);
 										errdesc = strerror(errno);
