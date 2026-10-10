@@ -89,6 +89,9 @@
 #include "mb2stream.h"
 
 static int stream_mode = 0;
+/* --media: read named files from the media folder (the AFC root,
+ * /var/mobile/Media) instead of an app's Documents. Needs --stream. */
+static int media_mode = 0;
 static uint64_t n_files = 0, n_bytes = 0, n_skipped = 0, n_errors = 0, n_inbackup = 0;
 
 /* The --skip-from list, sorted for binary search. */
@@ -424,6 +427,7 @@ static void print_usage(const char *name)
 	fprintf(stderr, "Copy an app's File Sharing Documents folder to DEST_DIR (created if needed).\n");
 	fprintf(stderr, "  --skip-from FILE   don't copy the paths listed in FILE (NUL-separated, relative to Documents; - for stdin)\n");
 	fprintf(stderr, "  --stream           write the files to stdout as records instead of DEST_DIR\n");
+	fprintf(stderr, "       %s [-u UDID] --stream --media PATH...   (read files from the media folder, e.g. PhotoData/Photos.sqlite)\n", name);
 }
 
 int main(int argc, char *argv[])
@@ -434,10 +438,11 @@ int main(int argc, char *argv[])
 		{ "udid", required_argument, NULL, 'u' },
 		{ "skip-from", required_argument, NULL, 's' },
 		{ "stream", no_argument, NULL, 'S' },
+		{ "media", no_argument, NULL, 'M' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
-	while ((c = getopt_long(argc, argv, "u:s:hS", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "u:s:hSM", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'u':
 			udid = optarg;
@@ -451,6 +456,9 @@ int main(int argc, char *argv[])
 		case 'S':
 			stream_mode = 1;
 			break;
+		case 'M':
+			media_mode = 1;
+			break;
 		case 'h':
 			print_usage(argv[0]);
 			return 0;
@@ -459,7 +467,11 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
-	if (argc - optind != (stream_mode ? 1 : 2)) {
+	if (media_mode && !stream_mode) {
+		fprintf(stderr, "ERROR: --media needs --stream\n");
+		return 1;
+	}
+	if (media_mode ? argc - optind < 1 : argc - optind != (stream_mode ? 1 : 2)) {
 		print_usage(argv[0]);
 		return 1;
 	}
@@ -480,6 +492,45 @@ int main(int argc, char *argv[])
 	if (idevice_new_with_options(&device, udid, IDEVICE_LOOKUP_USBMUX) != IDEVICE_E_SUCCESS) {
 		fprintf(stderr, "ERROR: No device found%s%s\n", udid ? ": " : "", udid ? udid : "");
 		return 1;
+	}
+	if (media_mode) {
+		/* Read-only: files are only opened for reading. */
+		if (afc_client_start_service(device, &afc, TOOL_NAME) != AFC_E_SUCCESS || !afc) {
+			fprintf(stderr, "ERROR: Could not start the media file service\n");
+			idevice_free(device);
+			return 1;
+		}
+		for (int i = optind; i < argc; i++) {
+			const char *path = argv[i];
+			char **info = NULL;
+			const char *ifmt = NULL, *mtime = NULL;
+			if (afc_get_file_info(afc, path, &info) != AFC_E_SUCCESS || !info) {
+				mb2s_skip(path, "not found", 's');
+				continue;
+			}
+			for (char **kv = info; kv[0] && kv[1]; kv += 2) {
+				if (!strcmp(kv[0], "st_ifmt")) ifmt = kv[1];
+				else if (!strcmp(kv[0], "st_mtime")) mtime = kv[1];
+			}
+			if (!ifmt || strcmp(ifmt, "S_IFREG")) {
+				mb2s_skip(path, "not a regular file", 's');
+			} else {
+				int64_t n = copy_file(afc, path, NULL, path, mtime);
+				if (n >= 0) {
+					n_files++;
+					n_bytes += (uint64_t)n;
+				}
+			}
+			afc_dictionary_free(info);
+		}
+		ret = n_errors ? 2 : 0;
+		if (mb2s_end_totals((uint32_t)n_files, n_bytes) < 0) {
+			fprintf(stderr, "ERROR: writing the stream failed\n");
+			ret = 1;
+		}
+		afc_client_free(afc);
+		idevice_free(device);
+		return ret;
 	}
 	do {
 		lockdownd_error_t lerr = lockdownd_client_new_with_handshake(device, &lockdown, TOOL_NAME);
